@@ -1,0 +1,7 @@
+{
+  "amount": "1500.00",
+  "currency": "RUB",
+  "description": "Оплата заказа #42",
+  "metadata": {"order_id": 42},
+  "webhook_url": "http://webhook-receiver:9000/webhooks/fail"
+}

@@ -1,0 +1,160 @@
+name: payments-service
+
+# Общее для api / consumer / migrations: один Dockerfile, слои общие (кеш BuildKit).
+x-app: &app
+  build:
+    context: .
+    target: runtime
+  restart: on-failure
+  environment:
+    DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-payments}:${POSTGRES_PASSWORD:-payments}@postgres:5432/${POSTGRES_DB:-payments}
+    RABBITMQ_URL: amqp://${RABBITMQ_USER:-payments}:${RABBITMQ_PASSWORD:-payments}@rabbitmq:5672/
+    # `-` без двоеточия: явно пустое значение из .env не подменяется дефолтом
+    # (WEBHOOK_SECRET= отключает подпись, API_KEY= не даст API стартовать).
+    API_KEY: ${API_KEY-dev-api-key}
+    WEBHOOK_SECRET: ${WEBHOOK_SECRET-dev-webhook-secret}
+    # Демо-приёмник webhook'ов живёт во внутренней сети compose (приватные адреса). В проде — false.
+    WEBHOOK_ALLOW_PRIVATE_NETWORKS: ${WEBHOOK_ALLOW_PRIVATE_NETWORKS:-true}
+    # Ниже — пробрасываются из .env / окружения, если заданы; иначе действуют значения по умолчанию
+    # из app/config.py (полный список с описанием — в README и .env.example).
+    LOG_LEVEL:
+    DOCS_ENABLED:
+    API_MAX_BODY_SIZE:
+    DB_POOL_SIZE:
+    DB_MAX_OVERFLOW:
+    DB_ECHO:
+    RABBITMQ_EXCHANGE:
+    RABBITMQ_QUEUE:
+    RABBITMQ_PUBLISH_TIMEOUT:
+    OUTBOX_RELAY_ENABLED:
+    OUTBOX_POLL_INTERVAL:
+    OUTBOX_BATCH_SIZE:
+    OUTBOX_RETRY_BASE_DELAY:
+    OUTBOX_RETRY_MAX_DELAY:
+    CONSUMER_PREFETCH_COUNT:
+    CONSUMER_GRACEFUL_TIMEOUT:
+    RETRY_MAX_ATTEMPTS:
+    RETRY_BASE_DELAY:
+    RETRY_BACKOFF_MULTIPLIER:
+    GATEWAY_MIN_DELAY:
+    GATEWAY_MAX_DELAY:
+    GATEWAY_SUCCESS_RATE:
+    GATEWAY_ERROR_RATE:
+    GATEWAY_TIMEOUT:
+    WEBHOOK_TIMEOUT:
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: on-failure
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-payments}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-payments}
+      POSTGRES_DB: ${POSTGRES_DB:-payments}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # -h 127.0.0.1: проверяем TCP, а не unix-сокет временного init-сервера при первом запуске.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:4.1-management-alpine
+    restart: on-failure
+    # Стабильный hostname: RabbitMQ хранит данные в каталоге, зависящем от имени узла.
+    hostname: rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-payments}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-payments}
+    ports:
+      - "127.0.0.1:${RABBITMQ_MANAGEMENT_PORT:-15672}:15672"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_port_connectivity"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+
+  # Одноразовый job: миграции применяются ровно один раз до старта api и consumer,
+  # без гонки между несколькими репликами.
+  migrations:
+    <<: *app
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    <<: *app
+    ports:
+      - "127.0.0.1:${API_PORT:-8000}:8000"
+    depends_on:
+      migrations:
+        condition: service_completed_successfully
+      # API стартует и без брокера (outbox relay подключается с ретраями), ожидание лишь убирает
+      # предупреждения «broker is not available yet» из логов при первом запуске.
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    # Мягкая остановка outbox relay (до 10 с) + закрытие соединений.
+    stop_grace_period: 20s
+
+  consumer:
+    <<: *app
+    # ASGI-обёртка FastStream: обработка очереди + GET /health для healthcheck.
+    command: ["uvicorn", "app.consumer.main:app", "--host", "0.0.0.0", "--port", "8000", "--no-access-log", "--no-server-header"]
+    depends_on:
+      migrations:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=6)"]
+      interval: 10s
+      timeout: 8s
+      retries: 5
+      start_period: 10s
+    # Даём дообработать сообщения в работе: должно быть больше CONSUMER_GRACEFUL_TIMEOUT (30 с).
+    stop_grace_period: 40s
+
+  # --- docker compose --profile demo up: приёмник webhook'ов для ручной проверки (localhost:8090) ---
+  webhook-receiver:
+    build:
+      context: .
+      target: runtime
+    profiles: ["demo"]
+    restart: on-failure
+    command: ["uvicorn", "tools.webhook_receiver:app", "--host", "0.0.0.0", "--port", "9000", "--no-server-header"]
+    environment:
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET-dev-webhook-secret}  # чтобы проверять подпись
+    ports:
+      - "127.0.0.1:${WEBHOOK_RECEIVER_PORT:-8090}:9000"
+
+  # --- docker compose --profile test run --rm tests: тесты против настоящих PostgreSQL и RabbitMQ ---
+  tests:
+    build:
+      context: .
+      target: test
+    profiles: ["test"]
+    environment:
+      TEST_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-payments}:${POSTGRES_PASSWORD:-payments}@postgres:5432/payments_test
+      TEST_RABBITMQ_URL: amqp://${RABBITMQ_USER:-payments}:${RABBITMQ_PASSWORD:-payments}@rabbitmq:5672/
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+volumes:
+  postgres-data:
+  rabbitmq-data:

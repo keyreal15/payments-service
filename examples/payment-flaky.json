@@ -1,0 +1,7 @@
+{
+  "amount": "10.50",
+  "currency": "USD",
+  "description": "Webhook-получатель дважды отвечает 503, потом 200",
+  "metadata": {},
+  "webhook_url": "http://webhook-receiver:9000/webhooks/flaky?failures=2"
+}

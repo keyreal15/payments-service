@@ -1,0 +1,9 @@
+{
+  "amount": "250.00",
+  "currency": "EUR",
+  "description": "Получатель отвечает 503 три раза: сообщение уйдёт в DLQ, после replay — доставится",
+  "metadata": {
+    "scenario": "dlq-replay"
+  },
+  "webhook_url": "http://webhook-receiver:9000/webhooks/flaky?failures=3"
+}

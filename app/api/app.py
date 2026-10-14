@@ -1,10 +1,10 @@
-import asyncio
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import APIRouter, Depends, FastAPI
 
+from app.api.background import BackgroundWorker, start_worker, stop_worker
 from app.api.dependencies import AppContainer, verify_api_key
 from app.api.errors import register_exception_handlers
 from app.api.health import router as health_router
@@ -17,25 +17,9 @@ from app.messaging.outbox_relay import OutboxRelay
 from app.messaging.publisher import RabbitEventPublisher
 from app.messaging.retry import retry_policy_from_settings
 from app.messaging.topology import build_topology
+from app.services.reconciliation import StalePaymentsReconciler
 
 logger = logging.getLogger(__name__)
-
-RELAY_STOP_TIMEOUT = 10.0
-
-
-def _report_relay_exit(task: asyncio.Task[None]) -> None:
-    if not task.cancelled() and task.exception() is not None:
-        logger.critical("Outbox relay crashed, events are not being published", exc_info=task.exception())
-
-
-async def _stop_relay(relay: OutboxRelay, task: asyncio.Task[None]) -> None:
-    relay.stop()
-    try:
-        await asyncio.wait_for(task, timeout=RELAY_STOP_TIMEOUT)  # по таймауту задача отменяется
-    except TimeoutError:
-        logger.warning("Outbox relay did not stop within %.0fs and was cancelled", RELAY_STOP_TIMEOUT)
-    except Exception:
-        logger.exception("Outbox relay finished with an error")
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -51,10 +35,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         topology = build_topology(settings, retry_policy_from_settings(settings))
         session_factory = create_session_factory(engine)
 
-        # Брокер не ждём на старте: подключение (с ретраями) выполняет relay в фоне.
-        # API принимает платежи и без RabbitMQ — события копятся в outbox.
+        # Брокер не ждём на старте: к нему подключается relay (с ретраями), а API принимает платежи
+        # и без RabbitMQ — события копятся в outbox.
         relay: OutboxRelay | None = None
-        relay_task: asyncio.Task[None] | None = None
+        workers: dict[str, BackgroundWorker] = {}
         if settings.outbox_relay_enabled:
             relay = OutboxRelay(
                 session_factory,
@@ -64,8 +48,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 retry_base_delay=settings.outbox_retry_base_delay,
                 retry_max_delay=settings.outbox_retry_max_delay,
             )
-            relay_task = asyncio.create_task(relay.run(), name="outbox-relay")
-            relay_task.add_done_callback(_report_relay_exit)
+            workers["outbox_relay"] = relay
+            workers["reconciler"] = StalePaymentsReconciler(
+                session_factory,
+                routing_key=topology.routing_key,
+                stale_after=settings.reconcile_stale_after,
+                interval=settings.reconcile_interval,
+                on_enqueued=relay.notify,
+            )
+        tasks = {name: start_worker(name, worker) for name, worker in workers.items()}
 
         app.state.container = AppContainer(
             api_key=api_key,
@@ -73,14 +64,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             broker=broker,
             topology=topology,
             relay=relay,
-            relay_task=relay_task,
+            background_tasks=tasks,
         )
         try:
             yield
         finally:
             try:
-                if relay is not None and relay_task is not None:
-                    await _stop_relay(relay, relay_task)
+                for name, worker in workers.items():
+                    await stop_worker(worker, tasks[name])
                 await broker.stop()
             finally:
                 await engine.dispose()

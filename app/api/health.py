@@ -28,8 +28,8 @@ class Readiness(BaseModel):
     status: State
     database: State
     rabbitmq: Literal["ok", "unavailable", "disabled"]
-    outbox_relay: Literal["running", "stopped", "disabled"]
     outbox_backlog: int | None
+    background_tasks: dict[str, Literal["running", "stopped"]]
 
 
 @router.get("/live", summary="Liveness probe")
@@ -43,14 +43,13 @@ async def live() -> Liveness:
     responses={
         status.HTTP_503_SERVICE_UNAVAILABLE: {
             "model": Readiness,
-            "description": "PostgreSQL недоступна или упала фоновая задача outbox relay",
+            "description": "PostgreSQL недоступна или упала фоновая задача (outbox relay, сверка)",
         }
     },
 )
 async def ready(container: ContainerDep, response: Response) -> Readiness:
-    """Готовность: PostgreSQL доступна и outbox relay работает. Без RabbitMQ API продолжает принимать
-    платежи (события копятся в outbox), поэтому брокер и размер очереди outbox — информационные поля.
-    При OUTBOX_RELAY_ENABLED=false API к брокеру не подключается (rabbitmq: disabled)."""
+    """Готовность: PostgreSQL доступна и фоновые задачи живы. Без RabbitMQ API продолжает принимать
+    платежи (события копятся в outbox), поэтому брокер и размер outbox — информационные поля."""
     backlog: int | None = None
     try:
         async with asyncio.timeout(CHECK_TIMEOUT), container.session_factory() as session:
@@ -63,13 +62,16 @@ async def ready(container: ContainerDep, response: Response) -> Readiness:
         logger.warning("Readiness check: database is unavailable", exc_info=True)
         database = "unavailable"
 
-    relay: Literal["running", "stopped", "disabled"] = "disabled"
-    rabbitmq: Literal["ok", "unavailable", "disabled"] = "disabled"
-    if container.relay_task is not None:
-        relay = "stopped" if container.relay_task.done() else "running"
+    rabbitmq: Literal["ok", "unavailable", "disabled"] = "disabled"  # relay выключен — брокер API не нужен
+    if container.relay is not None:
         rabbitmq = "ok" if await container.broker.ping(timeout=1.0) else "unavailable"
+    tasks: dict[str, Literal["running", "stopped"]] = {
+        name: "stopped" if task.done() else "running" for name, task in container.background_tasks.items()
+    }
 
-    overall: State = "ok" if database == "ok" and relay != "stopped" else "unavailable"
+    overall: State = "ok" if database == "ok" and "stopped" not in tasks.values() else "unavailable"
     if overall != "ok":
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
-    return Readiness(status=overall, database=database, rabbitmq=rabbitmq, outbox_relay=relay, outbox_backlog=backlog)
+    return Readiness(
+        status=overall, database=database, rabbitmq=rabbitmq, outbox_backlog=backlog, background_tasks=tasks
+    )

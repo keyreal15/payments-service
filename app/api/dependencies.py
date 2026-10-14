@@ -23,7 +23,7 @@ class AppContainer:
     broker: RabbitBroker
     topology: Topology
     relay: OutboxRelay | None
-    relay_task: asyncio.Task[None] | None
+    background_tasks: dict[str, asyncio.Task[None]]
 
 
 def get_container(request: Request) -> AppContainer:

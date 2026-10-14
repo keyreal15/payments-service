@@ -63,6 +63,8 @@ class Payment(Base):
         CheckConstraint(
             "status = 'pending' OR (lease_id IS NULL AND lease_expires_at IS NULL)", name="lease_only_while_pending"
         ),
+        # Сверка ищет «старые» pending-платежи — финальные в индекс не попадают.
+        Index("ix_payments_pending_created_at", "created_at", postgresql_where=text("status = 'pending'")),
     )
 
 
@@ -88,4 +90,5 @@ class OutboxMessage(Base):
             "created_at",
             postgresql_where=text("published_at IS NULL"),
         ),
+        Index("ix_outbox_aggregate_id_created_at", "aggregate_id", "created_at"),
     )

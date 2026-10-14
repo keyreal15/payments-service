@@ -16,7 +16,7 @@ from app.messaging.retry import (
     strip_broker_headers,
 )
 from app.messaging.topology import Topology
-from app.schemas import PaymentCreatedEvent
+from app.schemas import PaymentEvent
 from app.services.errors import PermanentProcessingError, TransientProcessingError
 from app.services.processing import PaymentProcessor
 
@@ -54,7 +54,7 @@ class PaymentCreatedHandler:
         self._retry_policy = retry_policy
         self._publish_timeout = publish_timeout
 
-    async def handle(self, event: PaymentCreatedEvent, message: RabbitMessage) -> None:
+    async def handle(self, event: PaymentEvent, message: RabbitMessage) -> None:
         attempt = get_attempt(message.headers)
         payment_id = event.payment_id
         max_attempts = self._retry_policy.max_attempts

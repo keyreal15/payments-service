@@ -14,7 +14,7 @@ from pamqp.commands import Basic
 from app.consumer.handler import PaymentCreatedHandler
 from app.messaging.retry import ATTEMPT_HEADER, DEAD_LETTER_REASON_HEADER, LAST_ERROR_HEADER, RetryPolicy
 from app.messaging.topology import build_topology
-from app.schemas import PaymentCreatedEvent
+from app.schemas import PaymentEvent
 from app.services.errors import (
     DatabaseUnavailableError,
     PaymentBusyError,
@@ -74,7 +74,7 @@ async def handle(
     handler = PaymentCreatedHandler(
         cast(Any, FakeProcessor(error)), cast(Any, broker), TOPOLOGY, POLICY, publish_timeout=1.0
     )
-    await handler.handle(PaymentCreatedEvent(payment_id=uuid.uuid4()), make_message(attempt, headers or {}))
+    await handler.handle(PaymentEvent(payment_id=uuid.uuid4()), make_message(attempt, headers or {}))
     return broker
 
 

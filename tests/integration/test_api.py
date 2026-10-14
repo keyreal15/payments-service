@@ -84,8 +84,8 @@ async def test_health_endpoints_are_public(api_client: httpx.AsyncClient, sessio
         "status": "ok",
         "database": "ok",
         "rabbitmq": "disabled",
-        "outbox_relay": "disabled",
         "outbox_backlog": 0,
+        "background_tasks": {},
     }
 
 
@@ -120,11 +120,11 @@ async def test_readiness_fails_when_outbox_relay_crashed(settings: Settings) -> 
         crashed = asyncio.create_task(crash())
         await asyncio.wait([crashed])
         container: AppContainer = app.state.container
-        container.relay_task = crashed
+        container.background_tasks["outbox_relay"] = crashed
         response = await client.get("/health/ready")
 
     assert response.status_code == 503
-    assert response.json()["outbox_relay"] == "stopped"
+    assert response.json()["background_tasks"] == {"outbox_relay": "stopped"}
 
 
 async def test_api_accepts_payments_while_rabbitmq_is_unreachable(
@@ -139,7 +139,7 @@ async def test_api_accepts_payments_while_rabbitmq_is_unreachable(
     assert response.status_code == 202
     assert ready.status_code == 200
     assert ready.json()["rabbitmq"] == "unavailable"
-    assert ready.json()["outbox_relay"] == "running"
+    assert ready.json()["background_tasks"] == {"outbox_relay": "running", "reconciler": "running"}
     assert ready.json()["outbox_backlog"] == 1
     async with session_factory() as session:
         [event] = (await session.scalars(select(OutboxMessage))).all()

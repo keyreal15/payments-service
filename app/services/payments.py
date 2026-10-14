@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.models import Payment
 from app.repositories.outbox import OutboxRepository
 from app.repositories.payments import PaymentRepository
-from app.schemas import PaymentCreate, PaymentCreatedEvent
+from app.schemas import PaymentCreate, PaymentEvent
 from app.services.errors import IdempotencyKeyReusedError, PaymentNotFoundError
 
 PAYMENT_CREATED_EVENT = "payment.created"
@@ -52,7 +52,7 @@ class PaymentService:
                     event_type=PAYMENT_CREATED_EVENT,
                     aggregate_id=payment.id,
                     routing_key=self._routing_key,
-                    payload=PaymentCreatedEvent(payment_id=payment.id).model_dump(mode="json"),
+                    payload=PaymentEvent(payment_id=payment.id).model_dump(mode="json"),
                 )
                 created = True
             else:

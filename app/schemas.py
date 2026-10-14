@@ -188,8 +188,10 @@ class PaymentRead(BaseModel):
     processed_at: datetime | None
 
 
-class PaymentCreatedEvent(BaseModel):
-    """Сообщение в очереди payments.new. Источник истины — БД, поэтому в событии только идентификатор."""
+class PaymentEvent(BaseModel):
+    """Сообщение в очереди payments.new (payment.created / payment.reconciliation).
+
+    Источник истины — БД, поэтому в событии только идентификатор."""
 
     payment_id: uuid.UUID
 

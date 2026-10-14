@@ -1,4 +1,5 @@
 import uuid
+from collections.abc import Sequence
 from datetime import timedelta
 from decimal import Decimal
 from typing import Any
@@ -7,7 +8,7 @@ from sqlalchemy import func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import Payment
+from app.db.models import OutboxMessage, Payment
 from app.enums import Currency, PaymentStatus
 
 
@@ -79,6 +80,31 @@ class PaymentRepository:
             .execution_options(synchronize_session=False)
         )
         await self._session.execute(stmt)
+
+    async def lock_stale_pending(self, stale_after: timedelta, limit: int) -> Sequence[uuid.UUID]:
+        """Pending-платежи старше stale_after без активной аренды, по которым за это время не создавалось событий.
+
+        SKIP LOCKED: несколько реплик API не возьмут одни и те же платежи.
+        """
+        now = func.now()
+        recent_event = (
+            select(OutboxMessage.id)
+            .where(OutboxMessage.aggregate_id == Payment.id, OutboxMessage.created_at > now - stale_after)
+            .exists()
+        )
+        stmt = (
+            select(Payment.id)
+            .where(
+                Payment.status == PaymentStatus.PENDING,
+                Payment.created_at < now - stale_after,
+                or_(Payment.lease_expires_at.is_(None), Payment.lease_expires_at < now),
+                ~recent_event,
+            )
+            .order_by(Payment.created_at)
+            .limit(limit)
+            .with_for_update(skip_locked=True, of=Payment)
+        )
+        return (await self._session.scalars(stmt)).all()
 
     async def get_by_idempotency_key(self, idempotency_key: str) -> Payment | None:
         stmt = select(Payment).where(Payment.idempotency_key == idempotency_key)

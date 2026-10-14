@@ -9,7 +9,7 @@ from app.db.session import create_db_engine, create_session_factory
 from app.messaging.broker import create_broker
 from app.messaging.retry import retry_policy_from_settings
 from app.messaging.topology import build_topology, declare_topology
-from app.schemas import PaymentCreatedEvent
+from app.schemas import PaymentEvent
 from app.services.gateway import EmulatedPaymentGateway, PaymentGateway
 from app.services.processing import PaymentProcessor
 from app.services.webhooks import WebhookSender
@@ -71,7 +71,7 @@ def create_consumer_app(
         channel=subscriber_channel,
         ack_policy=AckPolicy.REJECT_ON_ERROR,
     )
-    async def handle_payment_created(event: PaymentCreatedEvent, message: RabbitMessage) -> None:
+    async def handle_payment_created(event: PaymentEvent, message: RabbitMessage) -> None:
         await handler.handle(event, message)
 
     async def declare() -> None:

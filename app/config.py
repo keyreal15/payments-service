@@ -37,6 +37,10 @@ class Settings(BaseSettings):
     outbox_retry_base_delay: float = Field(default=1.0, gt=0)
     outbox_retry_max_delay: float = Field(default=30.0, gt=0)
 
+    # --- Сверка зависших pending-платежей (работает в процессе API вместе с relay) ---
+    reconcile_interval: float = Field(default=60.0, gt=0)
+    reconcile_stale_after: float = Field(default=300.0, gt=0)
+
     # --- Consumer ---
     consumer_prefetch_count: int = Field(default=50, ge=1)
     consumer_graceful_timeout: float = Field(default=30.0, gt=0)

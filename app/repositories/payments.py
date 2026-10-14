@@ -1,8 +1,9 @@
 import uuid
+from datetime import timedelta
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -50,34 +51,47 @@ class PaymentRepository:
     async def get(self, payment_id: uuid.UUID) -> Payment | None:
         return await self._session.get(Payment, payment_id)
 
-    async def lock_pending(self, payment_id: uuid.UUID) -> Payment | None:
-        """Блокирует pending-платёж для обработки (SELECT ... FOR NO KEY UPDATE SKIP LOCKED).
+    async def acquire_lease(self, payment_id: uuid.UUID, lease_id: uuid.UUID, duration: timedelta) -> Payment | None:
+        """Берёт pending-платёж в обработку, если его не держит другой обработчик (или его аренда истекла).
 
-        None — платёж не pending или прямо сейчас заблокирован другим обработчиком.
-        NO KEY: ключевые колонки не меняются, будущие FK на payments не будут ждать эту блокировку.
+        None — платёж не pending или аренда занята.
         """
+        now = func.statement_timestamp()
         stmt = (
-            select(Payment)
-            .where(Payment.id == payment_id, Payment.status == PaymentStatus.PENDING)
-            .with_for_update(skip_locked=True, key_share=True)
+            update(Payment)
+            .where(
+                Payment.id == payment_id,
+                Payment.status == PaymentStatus.PENDING,
+                or_(Payment.lease_expires_at.is_(None), Payment.lease_expires_at < now),
+            )
+            .values(lease_id=lease_id, lease_expires_at=now + duration)
+            .returning(Payment)
+            .execution_options(synchronize_session=False, populate_existing=True)
         )
         return (await self._session.scalars(stmt)).one_or_none()
+
+    async def release_lease(self, payment_id: uuid.UUID, lease_id: uuid.UUID) -> None:
+        """Отпускает свою аренду (после сбоя шлюза), чтобы повтор не ждал её истечения."""
+        stmt = (
+            update(Payment)
+            .where(Payment.id == payment_id, Payment.lease_id == lease_id, Payment.status == PaymentStatus.PENDING)
+            .values(lease_id=None, lease_expires_at=None)
+            .execution_options(synchronize_session=False)
+        )
+        await self._session.execute(stmt)
 
     async def get_by_idempotency_key(self, idempotency_key: str) -> Payment | None:
         stmt = select(Payment).where(Payment.idempotency_key == idempotency_key)
         return (await self._session.scalars(stmt)).one_or_none()
 
     async def finalize(self, payment_id: uuid.UUID, status: PaymentStatus) -> Payment | None:
-        """Compare-and-set pending -> final. None, если платёж уже был финализирован кем-то ещё."""
+        """Compare-and-set pending -> final. None, если платёж уже финализирован кем-то ещё."""
         stmt = (
             update(Payment)
             .where(Payment.id == payment_id, Payment.status == PaymentStatus.PENDING)
-            # statement_timestamp(), а не now(): now() — время начала транзакции, а она открыта
-            # ещё до вызова шлюза (см. PaymentProcessor), processed_at был бы раньше реального.
-            .values(status=status, processed_at=func.statement_timestamp())
+            .values(status=status, processed_at=func.statement_timestamp(), lease_id=None, lease_expires_at=None)
             .returning(Payment)
-            # populate_existing: если платёж уже загружен в сессию, обновить его атрибуты из RETURNING,
-            # иначе identity map вернёт объект со старым статусом.
+            # populate_existing: объект из identity map получит значения из RETURNING, а не останется старым.
             .execution_options(synchronize_session=False, populate_existing=True)
         )
         return (await self._session.scalars(stmt)).one_or_none()

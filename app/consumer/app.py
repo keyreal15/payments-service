@@ -28,13 +28,7 @@ def create_consumer_app(
     retry_policy = retry_policy_from_settings(settings)
     topology = build_topology(settings, retry_policy)
     broker = create_broker(settings, graceful_timeout=settings.consumer_graceful_timeout)
-    engine = create_db_engine(
-        settings,
-        application_name="payments-consumer",
-        # Каждое сообщение в работе держит соединение на время вызова шлюза (см. PaymentProcessor).
-        min_pool_size=settings.consumer_prefetch_count,
-        idle_in_transaction_timeout=settings.gateway_timeout * 2,
-    )
+    engine = create_db_engine(settings, application_name="payments-consumer")
     client = http_client or httpx.AsyncClient(
         timeout=settings.webhook_timeout,
         follow_redirects=False,

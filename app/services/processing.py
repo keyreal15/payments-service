@@ -1,40 +1,33 @@
 import asyncio
 import logging
 import uuid
+from collections.abc import Awaitable, Callable
+from datetime import timedelta
+from typing import TypeVar
 
 from app.db.errors import is_database_unavailable
 from app.db.models import Payment
 from app.db.session import SessionFactory
+from app.enums import PaymentStatus
 from app.repositories.payments import PaymentRepository
-from app.services.errors import (
-    DatabaseUnavailableError,
-    PaymentBusyError,
-    PaymentNotFoundError,
-    PermanentProcessingError,
-    TransientProcessingError,
-)
+from app.services.errors import DatabaseUnavailableError, PaymentBusyError, PaymentNotFoundError
 from app.services.gateway import GatewayError, PaymentGateway
 from app.services.webhooks import WebhookSender
 
 logger = logging.getLogger(__name__)
 
+T = TypeVar("T")
+
 
 class PaymentProcessor:
-    """Обработка события payments.new. Идемпотентна: безопасна при повторной и параллельной доставке.
+    """Обработка события по платежу: шлюз -> статус в БД -> webhook. Безопасна при повторной и параллельной доставке.
 
-    1. Pending-платёж блокируется (SELECT ... FOR NO KEY UPDATE SKIP LOCKED), проводится через шлюз
-       с idempotency key = payment.id, результат фиксируется в той же транзакции:
-         * параллельный дубль видит блокировку -> PaymentBusyError -> сообщение откладывается
-           (не теряется: если владелец блокировки умрёт, дубль обработает платёж позже);
-         * дубль после фиксации видит финальный статус и шлюз не вызывает.
-       Транзакция держится на время вызова шлюза — осознанный компромисс ради отсутствия
-       параллельных списаний. Её длительность ограничена gateway_timeout, а «зависшие» сессии
-       PostgreSQL обрывает по idle_in_transaction_session_timeout (см. create_consumer_app).
-    2. Webhook отправляется после коммита, вне транзакции. Ошибка -> исключение -> retry;
-       при повторе шаг 1 пропускается и статус не меняется.
-
-    Недоступность PostgreSQL на шаге 1 превращается в DatabaseUnavailableError — сообщение
-    откладывается без расхода попытки (короткий сбой БД не должен отправлять всё в DLQ).
+    Платёж проводится в три коротких шага, транзакция не держится во время вызова шлюза:
+      1. аренда: pending-платёж помечается lease_id/lease_expires_at. Пока аренда жива, параллельный дубль
+         получает PaymentBusyError и откладывается; если обработчик умрёт, аренда истечёт и платёж подхватит повтор;
+      2. вызов шлюза с idempotency key = payment_id (повторный вызов вернёт тот же результат, а не спишет снова);
+      3. фиксация результата compare-and-set по статусу pending.
+    Для финализированного платежа шаги 1–3 пропускаются — повторяется только webhook.
     """
 
     def __init__(
@@ -49,47 +42,73 @@ class PaymentProcessor:
         self._gateway = gateway
         self._webhooks = webhooks
         self._gateway_timeout = gateway_timeout
+        # Аренда с запасом переживает вызов шлюза, который ограничен gateway_timeout.
+        self._lease_duration = timedelta(seconds=gateway_timeout * 2)
 
     async def process(self, payment_id: uuid.UUID) -> Payment:
-        payment = await self._charge_if_pending(payment_id)
+        payment = await self._settle(payment_id)
         await self._webhooks.send(payment)
         logger.info("Webhook for payment %s (%s) delivered", payment_id, payment.status.value)
         return payment
 
-    async def _charge_if_pending(self, payment_id: uuid.UUID) -> Payment:
+    async def _settle(self, payment_id: uuid.UUID) -> Payment:
+        lease_id = uuid.uuid4()
+        payment = await self._in_transaction(lambda repo: self._acquire(repo, payment_id, lease_id))
+        if payment.status.is_final:
+            logger.info("Payment %s already %s, skipping gateway call", payment_id, payment.status.value)
+            return payment
+
         try:
-            return await self._charge_if_pending_in_transaction(payment_id)
-        except (GatewayError, PermanentProcessingError, TransientProcessingError):
+            status = await self._charge(payment)
+        except BaseException:
+            await self._release_quietly(payment_id, lease_id)
             raise
+
+        finalized = await self._in_transaction(lambda repo: self._finalize(repo, payment_id, status))
+        logger.info("Payment %s processed: %s", payment_id, finalized.status.value)
+        return finalized
+
+    async def _charge(self, payment: Payment) -> PaymentStatus:
+        try:
+            async with asyncio.timeout(self._gateway_timeout):
+                return await self._gateway.charge(
+                    idempotency_key=str(payment.id), amount=payment.amount, currency=payment.currency
+                )
+        except TimeoutError as exc:
+            raise GatewayError(f"Gateway did not respond within {self._gateway_timeout}s") from exc
+
+    async def _acquire(self, repo: PaymentRepository, payment_id: uuid.UUID, lease_id: uuid.UUID) -> Payment:
+        payment = await repo.acquire_lease(payment_id, lease_id, self._lease_duration)
+        if payment is not None:
+            return payment
+        current = await repo.get(payment_id)
+        if current is None:
+            raise PaymentNotFoundError(payment_id)
+        if not current.status.is_final:
+            raise PaymentBusyError(payment_id)
+        return current
+
+    @staticmethod
+    async def _finalize(repo: PaymentRepository, payment_id: uuid.UUID, status: PaymentStatus) -> Payment:
+        payment = await repo.finalize(payment_id, status)
+        if payment is None:
+            # Аренда успела истечь, и платёж финализировал другой обработчик — тем же результатом шлюза.
+            payment = await repo.get(payment_id)
+            if payment is None:
+                raise PaymentNotFoundError(payment_id)
+        return payment
+
+    async def _release_quietly(self, payment_id: uuid.UUID, lease_id: uuid.UUID) -> None:
+        try:
+            await self._in_transaction(lambda repo: repo.release_lease(payment_id, lease_id))
+        except Exception:
+            logger.warning("Failed to release lease of payment %s, it will expire", payment_id, exc_info=True)
+
+    async def _in_transaction(self, operation: Callable[[PaymentRepository], Awaitable[T]]) -> T:
+        try:
+            async with self._session_factory() as session, session.begin():
+                return await operation(PaymentRepository(session))
         except Exception as exc:
             if is_database_unavailable(exc):
                 raise DatabaseUnavailableError(f"Database is unavailable: {exc!r}") from exc
             raise
-
-    async def _charge_if_pending_in_transaction(self, payment_id: uuid.UUID) -> Payment:
-        async with self._session_factory() as session, session.begin():
-            repo = PaymentRepository(session)
-            payment = await repo.lock_pending(payment_id)
-
-            if payment is None:
-                current = await repo.get(payment_id)
-                if current is None:
-                    raise PaymentNotFoundError(payment_id)
-                if not current.status.is_final:
-                    raise PaymentBusyError(payment_id)
-                logger.info("Payment %s already %s, skipping gateway call", payment_id, current.status.value)
-                return current
-
-            try:
-                async with asyncio.timeout(self._gateway_timeout):
-                    status = await self._gateway.charge(
-                        idempotency_key=str(payment.id), amount=payment.amount, currency=payment.currency
-                    )
-            except TimeoutError as exc:
-                raise GatewayError(f"Gateway did not respond within {self._gateway_timeout}s") from exc
-
-            finalized = await repo.finalize(payment_id, status)
-            if finalized is None:  # строка заблокирована нами — измениться не могла
-                raise RuntimeError(f"Payment {payment_id} changed while locked")
-            logger.info("Payment %s processed: %s", payment_id, finalized.status.value)
-            return finalized

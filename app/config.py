@@ -38,7 +38,7 @@ class Settings(BaseSettings):
     outbox_retry_max_delay: float = Field(default=30.0, gt=0)
 
     # --- Consumer ---
-    consumer_prefetch_count: int = Field(default=10, ge=1)
+    consumer_prefetch_count: int = Field(default=50, ge=1)
     consumer_graceful_timeout: float = Field(default=30.0, gt=0)
     retry_max_attempts: int = Field(default=3, ge=1)
     retry_base_delay: float = Field(default=2.0, gt=0)

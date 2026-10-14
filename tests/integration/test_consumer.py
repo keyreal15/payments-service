@@ -8,6 +8,7 @@ from typing import Any, cast
 
 import pytest
 from faststream.rabbit import RabbitBroker
+from sqlalchemy import text
 
 from app.config import Settings
 from app.db.session import SessionFactory
@@ -207,9 +208,40 @@ async def test_concurrent_duplicate_is_deferred_while_payment_is_locked(
     assert {json.loads(r.content)["payment"]["status"] for r in webhook.requests} == {"succeeded"}
     assert await queue_size(settings, topology.dead_letter_queue.name) == 0
     # Дубль действительно застал блокировку и был отложен (а не просто пришёл после коммита).
-    deferrals = [r for r in caplog.records if "locked by another consumer" in r.getMessage()]
+    deferrals = [r for r in caplog.records if "being processed by another consumer" in r.getMessage()]
     assert deferrals
     assert all("deferring" in r.getMessage() for r in deferrals)
+
+
+async def test_lease_of_crashed_consumer_expires_and_payment_is_processed(
+    run_consumer: ConsumerRunner,
+    publisher_broker: RabbitBroker,
+    topology: Topology,
+    session_factory: SessionFactory,
+    settings: Settings,
+) -> None:
+    """Обработчик «упал» посреди вызова шлюза: его аренда истекает, и платёж проводит следующая доставка."""
+    payment = await create_pending_payment(session_factory)
+    async with session_factory() as session, session.begin():
+        await session.execute(
+            text(
+                "UPDATE payments SET lease_id = gen_random_uuid(), "
+                "lease_expires_at = now() + interval '1 second' WHERE id = :id"
+            ),
+            {"id": payment.id},
+        )
+    webhook = WebhookRecorder()
+    gateway = CountingGateway()
+
+    async with run_consumer(webhook, gateway):
+        await publish_event(publisher_broker, topology, payment.id)
+        await wait_for(lambda: len(webhook.requests) == 1, message="processed after lease expiry")
+
+    stored = await get_payment(session_factory, payment.id)
+    assert stored.status is PaymentStatus.SUCCEEDED
+    assert (stored.lease_id, stored.lease_expires_at) == (None, None)
+    assert gateway.calls == [str(payment.id)]
+    assert await queue_size(settings, topology.dead_letter_queue.name) == 0
 
 
 @pytest.mark.parametrize("prefetch", [1, 3])

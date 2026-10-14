@@ -12,11 +12,17 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from app.db.base import Base
 
 INSERT = text(
-    "INSERT INTO payments (id, amount, currency, status, idempotency_key, request_hash, webhook_url, processed_at) "
-    "VALUES (gen_random_uuid(), :amount, :currency, :status, :key, 'h', 'http://x', :processed_at)"
+    "INSERT INTO payments (id, amount, currency, status, idempotency_key, request_hash, webhook_url, processed_at, "
+    "lease_id) VALUES (gen_random_uuid(), :amount, :currency, :status, :key, 'h', 'http://x', :processed_at, :lease_id)"
 )
 PROCESSED = datetime(2026, 1, 1, tzinfo=UTC)
-VALID_PENDING: dict[str, Any] = {"amount": 1, "currency": "RUB", "status": "pending", "processed_at": None}
+VALID_PENDING: dict[str, Any] = {
+    "amount": 1,
+    "currency": "RUB",
+    "status": "pending",
+    "processed_at": None,
+    "lease_id": None,
+}
 
 
 async def test_models_match_migrations(engine: AsyncEngine) -> None:
@@ -40,6 +46,7 @@ async def test_check_constraints_exist(engine: AsyncEngine) -> None:
         "ck_payments_currency",
         "ck_payments_payment_status",
         "ck_payments_processed_at_matches_status",
+        "ck_payments_lease_only_while_pending",
         "uq_payments_idempotency_key",
     } <= names
 
@@ -53,6 +60,10 @@ async def test_check_constraints_exist(engine: AsyncEngine) -> None:
         ({"status": "unknown", "processed_at": PROCESSED}, "ck_payments_payment_status"),
         ({"status": "succeeded"}, "ck_payments_processed_at_matches_status"),
         ({"processed_at": PROCESSED}, "ck_payments_processed_at_matches_status"),
+        (
+            {"status": "succeeded", "processed_at": PROCESSED, "lease_id": uuid.uuid4()},
+            "ck_payments_lease_only_while_pending",
+        ),
     ],
 )
 async def test_database_constraints(engine: AsyncEngine, override: dict[str, Any], constraint: str) -> None:

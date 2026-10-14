@@ -19,14 +19,10 @@ class TransientProcessingError(Exception):
 
 
 class PaymentBusyError(TransientProcessingError):
-    """Платёж прямо сейчас обрабатывается другим обработчиком (строка заблокирована).
-
-    Блокировка ограничена таймаутом шлюза и idle_in_transaction_session_timeout,
-    после чего платёж будет финальным или снова доступным.
-    """
+    """Платёж сейчас проводит другой обработчик (его аренда ещё не истекла)."""
 
     def __init__(self, payment_id: uuid.UUID) -> None:
-        super().__init__(f"Payment {payment_id} is locked by another consumer")
+        super().__init__(f"Payment {payment_id} is being processed by another consumer")
 
 
 class DatabaseUnavailableError(TransientProcessingError):

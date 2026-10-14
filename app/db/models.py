@@ -53,10 +53,16 @@ class Payment(Base):
     webhook_url: Mapped[str] = mapped_column(String(2048))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Аренда на обработку: кто и до какого момента проводит платёж через шлюз (см. PaymentProcessor).
+    lease_id: Mapped[uuid.UUID | None]
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     __table_args__ = (
         CheckConstraint("amount > 0", name="amount_positive"),
         CheckConstraint("(status = 'pending') = (processed_at IS NULL)", name="processed_at_matches_status"),
+        CheckConstraint(
+            "status = 'pending' OR (lease_id IS NULL AND lease_expires_at IS NULL)", name="lease_only_while_pending"
+        ),
     )
 
 

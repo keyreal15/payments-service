@@ -13,7 +13,7 @@ from sqlalchemy import text
 from app.config import Settings
 from app.db.session import SessionFactory
 from app.enums import PaymentStatus
-from app.messaging.retry import ATTEMPT_HEADER, DEAD_LETTER_REASON_HEADER, LAST_ERROR_HEADER
+from app.messaging.retry import ATTEMPT_HEADER, DEAD_LETTER_REASON_HEADER, LAST_ERROR_HEADER, LEASE_HEADER
 from app.messaging.topology import Topology
 from tests.integration.helpers import (
     ConsumerRunner,
@@ -242,6 +242,31 @@ async def test_lease_of_crashed_consumer_expires_and_payment_is_processed(
     assert (stored.lease_id, stored.lease_expires_at) == (None, None)
     assert gateway.calls == [str(payment.id)]
     assert await queue_size(settings, topology.dead_letter_queue.name) == 0
+
+
+async def test_redelivered_message_reclaims_its_own_lease_immediately(
+    run_consumer: ConsumerRunner, publisher_broker: RabbitBroker, topology: Topology, session_factory: SessionFactory
+) -> None:
+    """БД упала между арендой и фиксацией: повтор того же сообщения забирает свою аренду, не дожидаясь истечения."""
+    payment = await create_pending_payment(session_factory)
+    own_lease = uuid.uuid4()
+    async with session_factory() as session, session.begin():
+        await session.execute(
+            text("UPDATE payments SET lease_id = :lease, lease_expires_at = now() + interval '1 hour' WHERE id = :id"),
+            {"lease": own_lease, "id": payment.id},
+        )
+    webhook = WebhookRecorder()
+
+    async with run_consumer(webhook):
+        await publisher_broker.publish(
+            {"payment_id": str(payment.id)},
+            exchange=topology.exchange,
+            routing_key=topology.routing_key,
+            headers={LEASE_HEADER: str(own_lease), ATTEMPT_HEADER: 2},
+        )
+        await wait_for(lambda: len(webhook.requests) == 1, seconds=3, message="processed without waiting for expiry")
+
+    assert (await get_payment(session_factory, payment.id)).status is PaymentStatus.SUCCEEDED
 
 
 @pytest.mark.parametrize("prefetch", [1, 3])

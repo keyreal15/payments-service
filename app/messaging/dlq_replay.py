@@ -1,13 +1,9 @@
 """Возвращает сообщения из DLQ в основную очередь со сброшенным счётчиком попыток.
 
-Используется после устранения причины сбоя (например, клиент починил webhook):
-
     docker compose exec -T consumer python -m app.messaging.dlq_replay --limit 100
 
-Берётся не больше сообщений, чем было в DLQ на момент запуска: сообщение, которое
-сразу же снова упадёт в DLQ, не будет гоняться по кругу. Обработчик идемпотентен —
-для финализированного платежа шлюз повторно не вызывается, повторяется только webhook.
-Заголовки x-last-error / x-dead-letter-reason сохраняются как x-replayed-* для разбора.
+Берёт не больше сообщений, чем было в DLQ на старте (упавшее снова не гоняется по кругу);
+прежние причина и ошибка сохраняются в заголовках x-replayed-*.
 """
 
 import argparse
@@ -17,11 +13,12 @@ from typing import Any
 
 from app.config import Settings, get_settings
 from app.logging_config import configure_logging
-from app.messaging.broker import create_broker
+from app.messaging.broker import PUBLISH_TIMEOUT, create_broker
 from app.messaging.retry import (
     ATTEMPT_HEADER,
     DEAD_LETTER_REASON_HEADER,
     LAST_ERROR_HEADER,
+    LEASE_HEADER,
     retry_policy_from_settings,
     strip_broker_headers,
 )
@@ -34,7 +31,7 @@ def _replay_headers(headers: dict[str, Any]) -> dict[str, Any]:
     result = {
         key: value
         for key, value in strip_broker_headers(headers).items()
-        if key not in (ATTEMPT_HEADER, LAST_ERROR_HEADER, DEAD_LETTER_REASON_HEADER)
+        if key not in (ATTEMPT_HEADER, LAST_ERROR_HEADER, DEAD_LETTER_REASON_HEADER, LEASE_HEADER)
     }
     # Причина: наша (явная публикация в DLX) или нативная RabbitMQ (reject, x-delivery-limit).
     reason = headers.get(DEAD_LETTER_REASON_HEADER) or headers.get("x-first-death-reason")
@@ -70,7 +67,7 @@ async def replay(settings: Settings, limit: int) -> int:
                     content_type=message.content_type or "application/json",
                     persist=True,
                     mandatory=True,
-                    timeout=settings.rabbitmq_publish_timeout,
+                    timeout=PUBLISH_TIMEOUT,
                 )
             except Exception:
                 await message.nack(requeue=True)

@@ -8,6 +8,7 @@ from app.api.errors import error_response
 
 API_KEY_HEADER = "X-API-Key"
 PROTECTED_PATH_PREFIX = "/api/"
+MAX_BODY_SIZE = 64 * 1024
 
 
 def api_key_matches(provided: str | None, expected: str) -> bool:
@@ -25,7 +26,7 @@ class ApiGuardMiddleware:
       * тело больше max_body_size -> 413 (по Content-Length или по факту для chunked-запросов).
     """
 
-    def __init__(self, app: ASGIApp, *, api_key: str, max_body_size: int) -> None:
+    def __init__(self, app: ASGIApp, *, api_key: str, max_body_size: int = MAX_BODY_SIZE) -> None:
         self._app = app
         self._api_key = api_key
         self._max_body_size = max_body_size

@@ -42,7 +42,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if settings.outbox_relay_enabled:
             relay = OutboxRelay(
                 session_factory,
-                RabbitEventPublisher(broker, topology, timeout=settings.rabbitmq_publish_timeout),
+                RabbitEventPublisher(broker, topology),
                 batch_size=settings.outbox_batch_size,
                 poll_interval=settings.outbox_poll_interval,
                 retry_base_delay=settings.outbox_retry_base_delay,
@@ -86,7 +86,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         redoc_url="/redoc" if settings.docs_enabled else None,
         openapi_url="/openapi.json" if settings.docs_enabled else None,
     )
-    app.add_middleware(ApiGuardMiddleware, api_key=api_key, max_body_size=settings.api_max_body_size)
+    app.add_middleware(ApiGuardMiddleware, api_key=api_key)
     register_exception_handlers(app)
 
     api_v1 = APIRouter(prefix="/api/v1", dependencies=[Depends(verify_api_key)])

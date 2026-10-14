@@ -4,9 +4,9 @@ from faststream.rabbit import Channel
 from faststream.rabbit.annotations import RabbitMessage
 
 from app.config import Settings, get_settings
-from app.consumer.handler import PaymentCreatedHandler
+from app.consumer.handler import PaymentEventHandler
 from app.db.session import create_db_engine, create_session_factory
-from app.messaging.broker import create_broker
+from app.messaging.broker import PUBLISH_TIMEOUT, create_broker
 from app.messaging.retry import retry_policy_from_settings
 from app.messaging.topology import build_topology, declare_topology
 from app.schemas import PaymentEvent
@@ -53,16 +53,15 @@ def create_consumer_app(
         ),
         gateway_timeout=settings.gateway_timeout,
     )
-    handler = PaymentCreatedHandler(
+    handler = PaymentEventHandler(
         processor,
         broker,
         topology,
         retry_policy,
-        publish_timeout=settings.rabbitmq_publish_timeout,
+        publish_timeout=PUBLISH_TIMEOUT,
     )
 
-    # prefetch_count ограничивает число одновременно обрабатываемых сообщений:
-    # aiormq запускает обработку каждой доставки отдельной задачей.
+    # prefetch_count — сколько сообщений обрабатывается одновременно (каждая доставка — отдельная задача).
     subscriber_channel = Channel(prefetch_count=settings.consumer_prefetch_count)
 
     @broker.subscriber(
@@ -71,18 +70,13 @@ def create_consumer_app(
         channel=subscriber_channel,
         ack_policy=AckPolicy.REJECT_ON_ERROR,
     )
-    async def handle_payment_created(event: PaymentEvent, message: RabbitMessage) -> None:
+    async def handle_payment_event(event: PaymentEvent, message: RabbitMessage) -> None:
         await handler.handle(event, message)
 
     async def declare() -> None:
-        """Вся топология объявляется до старта подписчика: ошибка (например, PRECONDITION_FAILED
-        из-за несовпадения аргументов очереди) роняет старт процесса, а не оставляет его «живым»
-        без подписки.
-
-        payments.new объявляется на канале подписчика (с QoS): FastStream кеширует объявленные
-        очереди без учёта канала, и подписчик возьмёт из кеша именно этот объект. Объявление через
-        broker.declare_queue() привязало бы очередь к каналу по умолчанию — consume без prefetch.
-        """
+        """Топология объявляется до старта подписчика: ошибка (например, PRECONDITION_FAILED) роняет старт,
+        а не оставляет процесс «живым» без подписки. payments.new — на канале подписчика: FastStream кеширует
+        очереди без учёта канала, и через broker.declare_queue() consume пошёл бы без prefetch."""
         await broker.connect()
         await declare_topology(broker, topology, include_main_queue=False)
         queue = await broker.config.declarer.declare_queue(topology.queue, channel=subscriber_channel)

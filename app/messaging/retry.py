@@ -1,3 +1,4 @@
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -7,17 +8,14 @@ from app.config import Settings
 ATTEMPT_HEADER = "x-attempt"
 LAST_ERROR_HEADER = "x-last-error"
 DEAD_LETTER_REASON_HEADER = "x-dead-letter-reason"
+LEASE_HEADER = "x-lease-id"  # повтор сообщения забирает свою же аренду платежа, не дожидаясь истечения
 # Служебные заголовки брокера (dead-lettering, счётчики доставок) не переносятся в копии сообщений.
 _BROKER_HEADER_PREFIXES = ("x-death", "x-first-death", "x-last-death", "x-delivery-count", "x-acquired-count")
 
 
 @dataclass(frozen=True, slots=True)
 class RetryPolicy:
-    """max_attempts — общее число попыток обработки (первая + повторы).
-
-    После неудачной попытки N (N < max_attempts) сообщение откладывается на
-    base_delay * multiplier ** (N - 1) секунд; после последней — уходит в DLQ.
-    """
+    """max_attempts — всего попыток; после неудачной попытки N пауза base_delay * multiplier ** (N - 1)."""
 
     max_attempts: int
     base_delay: float
@@ -36,13 +34,19 @@ class RetryPolicy:
         return self.base_delay * self.multiplier ** (failed_attempt - 1)
 
     def delays_ms(self) -> list[int]:
-        """Ступени задержки. Хотя бы одна есть всегда: первая используется и для отсрочки
-        без расхода попытки (платёж занят другим обработчиком, недоступна БД)."""
+        """Ступени задержки; первая есть всегда — она же для отсрочки без расхода попытки."""
         return [round(self.delay_for(attempt) * 1000) for attempt in range(1, max(self.max_attempts, 2))]
 
 
 def strip_broker_headers(headers: Mapping[str, Any] | None) -> dict[str, Any]:
     return {key: value for key, value in (headers or {}).items() if not key.startswith(_BROKER_HEADER_PREFIXES)}
+
+
+def get_lease_id(headers: Mapping[str, Any] | None) -> uuid.UUID:
+    try:
+        return uuid.UUID(str((headers or {})[LEASE_HEADER]))
+    except (KeyError, ValueError):
+        return uuid.uuid4()
 
 
 def get_attempt(headers: Mapping[str, Any] | None) -> int:

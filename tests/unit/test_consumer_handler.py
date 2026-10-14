@@ -1,4 +1,4 @@
-"""Исходы обработки сообщения в PaymentCreatedHandler и маппинг ошибок PaymentProcessor — на фейках."""
+"""Исходы обработки сообщения в PaymentEventHandler и маппинг ошибок PaymentProcessor — на фейках."""
 
 import uuid
 from dataclasses import dataclass, field
@@ -11,8 +11,14 @@ from aiormq.exceptions import DeliveryError, PublishError
 from faststream.exceptions import NackMessage, RejectMessage
 from pamqp.commands import Basic
 
-from app.consumer.handler import PaymentCreatedHandler
-from app.messaging.retry import ATTEMPT_HEADER, DEAD_LETTER_REASON_HEADER, LAST_ERROR_HEADER, RetryPolicy
+from app.consumer.handler import PaymentEventHandler
+from app.messaging.retry import (
+    ATTEMPT_HEADER,
+    DEAD_LETTER_REASON_HEADER,
+    LAST_ERROR_HEADER,
+    LEASE_HEADER,
+    RetryPolicy,
+)
 from app.messaging.topology import build_topology
 from app.schemas import PaymentEvent
 from app.services.errors import (
@@ -44,8 +50,10 @@ class FakeBroker:
 @dataclass
 class FakeProcessor:
     error: Exception | None = None
+    lease_ids: list[uuid.UUID] = field(default_factory=list)
 
-    async def process(self, payment_id: uuid.UUID) -> None:
+    async def process(self, payment_id: uuid.UUID, lease_id: uuid.UUID) -> None:
+        self.lease_ids.append(lease_id)
         if self.error is not None:
             raise self.error
 
@@ -71,7 +79,7 @@ async def handle(
     headers: dict[str, Any] | None = None,
 ) -> FakeBroker:
     broker = broker or FakeBroker()
-    handler = PaymentCreatedHandler(
+    handler = PaymentEventHandler(
         cast(Any, FakeProcessor(error)), cast(Any, broker), TOPOLOGY, POLICY, publish_timeout=1.0
     )
     await handler.handle(PaymentEvent(payment_id=uuid.uuid4()), make_message(attempt, headers or {}))
@@ -122,6 +130,16 @@ async def test_transient_errors_do_not_consume_attempts(error: Exception) -> Non
     assert deferred["exchange"] is TOPOLOGY.retry_exchange
     assert deferred["routing_key"] == "payments.new.retry.10ms"
     assert deferred["headers"][ATTEMPT_HEADER] == 3
+
+
+async def test_retry_carries_lease_id_and_redelivery_reuses_it() -> None:
+    [retry] = (await handle(DatabaseUnavailableError("db is restarting"), attempt=1)).published
+    lease_id = uuid.UUID(retry["headers"][LEASE_HEADER])
+
+    processor = FakeProcessor()
+    handler = PaymentEventHandler(cast(Any, processor), cast(Any, FakeBroker()), TOPOLOGY, POLICY, publish_timeout=1.0)
+    await handler.handle(PaymentEvent(payment_id=uuid.uuid4()), make_message(2, retry["headers"]))
+    assert processor.lease_ids == [lease_id]  # повтор забирает свою аренду, а не ждёт её истечения
 
 
 async def test_broker_headers_are_dropped_and_custom_headers_preserved() -> None:

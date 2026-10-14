@@ -45,14 +45,14 @@ class PaymentProcessor:
         # Аренда с запасом переживает вызов шлюза, который ограничен gateway_timeout.
         self._lease_duration = timedelta(seconds=gateway_timeout * 2)
 
-    async def process(self, payment_id: uuid.UUID) -> Payment:
-        payment = await self._settle(payment_id)
+    async def process(self, payment_id: uuid.UUID, lease_id: uuid.UUID | None = None) -> Payment:
+        """lease_id передаётся при повторе того же сообщения, чтобы забрать свою аренду сразу."""
+        payment = await self._settle(payment_id, lease_id or uuid.uuid4())
         await self._webhooks.send(payment)
         logger.info("Webhook for payment %s (%s) delivered", payment_id, payment.status.value)
         return payment
 
-    async def _settle(self, payment_id: uuid.UUID) -> Payment:
-        lease_id = uuid.uuid4()
+    async def _settle(self, payment_id: uuid.UUID, lease_id: uuid.UUID) -> Payment:
         payment = await self._in_transaction(lambda repo: self._acquire(repo, payment_id, lease_id))
         if payment.status.is_final:
             logger.info("Payment %s already %s, skipping gateway call", payment_id, payment.status.value)

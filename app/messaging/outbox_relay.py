@@ -28,18 +28,10 @@ class BatchResult:
 
 
 class OutboxRelay:
-    """Публикует события из таблицы outbox в RabbitMQ.
+    """Публикует события outbox в RabbitMQ (at-least-once: published_at ставится после publisher confirm).
 
-    Гарантия — at-least-once: событие помечается опубликованным только после publisher confirm.
-    Падение между confirm и коммитом приведёт к повторной публикации — consumer идемпотентен.
-
-    Ошибки делятся на два вида:
-      * отказ по конкретному сообщению (nack / unroutable): сообщение откладывается со своим
-        экспоненциальным backoff, остальные продолжают публиковаться;
-      * недоступность брокера: весь цикл уходит в экспоненциальный backoff (прерывается только
-        остановкой), сами сообщения не откладываются — после восстановления уходят сразу.
-    Подключение к брокеру выполняется здесь же, поэтому API стартует и принимает платежи,
-    даже если RabbitMQ недоступен.
+    Отказ брокера по конкретному сообщению откладывает только его; недоступность брокера уводит
+    в backoff весь цикл, не трогая сами события.
     """
 
     def __init__(
@@ -62,16 +54,15 @@ class OutboxRelay:
         self._stopped = asyncio.Event()
 
     def notify(self) -> None:
-        """Будит relay сразу после коммита нового события, не дожидаясь poll_interval."""
+        """Новое событие закоммичено — публиковать, не дожидаясь poll_interval."""
         self._wakeup.set()
 
     def stop(self) -> None:
-        """Мягкая остановка: текущая пачка дообрабатывается, новая не начинается."""
         self._stopped.set()
         self._wakeup.set()
 
     def _backoff(self, attempt: int) -> float:
-        exponent = min(max(attempt, 1) - 1, 30)  # без ограничения 2**n переполнил бы float
+        exponent = min(max(attempt, 1) - 1, 30)  # без ограничения 2**n переполняет float
         return float(min(self._retry_base_delay * 2**exponent, self._retry_max_delay))
 
     async def publish_batch(self) -> BatchResult:
@@ -87,8 +78,7 @@ class OutboxRelay:
             if not messages:
                 return BatchResult(published=0, failed=0, broker_unavailable=False)
 
-            # Confirms приходят асинхронно: публикуем пачку конкурентно, а не по одному на RTT.
-            # Порядок между разными платежами не важен.
+            # Confirms приходят асинхронно — публикуем пачку конкурентно; порядок между платежами не важен.
             results = await asyncio.gather(
                 *(self._publisher.publish(message) for message in messages), return_exceptions=True
             )
@@ -100,11 +90,9 @@ class OutboxRelay:
                     published_ids.append(message.id)
                     continue
                 if not isinstance(result, Exception):
-                    raise result  # CancelledError и прочие BaseException не глотаем
+                    raise result  # CancelledError не глотаем
                 errors.append(result)
-                if isinstance(result, DeliveryError):
-                    # Брокер отказал именно этому сообщению — откладываем только его. Недоступность
-                    # брокера сообщения не касается: паузу держит цикл relay, счётчики не растут.
+                if isinstance(result, DeliveryError):  # nack / unroutable именно этого сообщения
                     message.attempts += 1
                     message.last_error = repr(result)[:MAX_ERROR_LENGTH]
                     message.next_attempt_at = func.statement_timestamp() + timedelta(
@@ -130,26 +118,22 @@ class OutboxRelay:
         logger.info("Outbox relay started")
         failure_streak = 0
         while not self._stopped.is_set():
-            # Сбрасываем флаг до чтения пачки: notify(), пришедший во время публикации,
-            # не потеряется и сразу запустит следующую итерацию.
-            self._wakeup.clear()
+            self._wakeup.clear()  # до чтения пачки, чтобы не потерять notify() во время публикации
             try:
                 result = await self.publish_batch()
             except Exception:
-                logger.exception("Outbox relay iteration failed (database unavailable?)")
+                logger.exception("Outbox relay iteration failed")
                 result = None
 
             if result is None or result.broker_unavailable:
                 failure_streak = min(failure_streak + 1, 64)
-                # Пауза не прерывается новыми событиями: иначе при недоступном брокере каждый
-                # POST /payments порождал бы попытку подключения.
+                # notify() эту паузу не прерывает: иначе каждый новый платёж порождал бы попытку подключения.
                 await self._wait(self._stopped, self._backoff(failure_streak))
                 continue
 
             failure_streak = 0
-            if result.attempted == self._batch_size:
-                continue  # вероятно, есть ещё — разбираем без паузы
-            await self._wait(self._wakeup, self._poll_interval)
+            if result.attempted < self._batch_size:
+                await self._wait(self._wakeup, self._poll_interval)
         logger.info("Outbox relay stopped")
 
     @staticmethod

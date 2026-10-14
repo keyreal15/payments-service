@@ -19,13 +19,10 @@ x-app: &app
     # из app/config.py (полный список с описанием — в README и .env.example).
     LOG_LEVEL:
     DOCS_ENABLED:
-    API_MAX_BODY_SIZE:
     DB_POOL_SIZE:
     DB_MAX_OVERFLOW:
-    DB_ECHO:
     RABBITMQ_EXCHANGE:
     RABBITMQ_QUEUE:
-    RABBITMQ_PUBLISH_TIMEOUT:
     OUTBOX_RELAY_ENABLED:
     OUTBOX_POLL_INTERVAL:
     OUTBOX_BATCH_SIZE:

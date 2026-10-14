@@ -4,6 +4,7 @@ from typing import Protocol
 from faststream.rabbit import RabbitBroker
 
 from app.db.models import OutboxMessage
+from app.messaging.broker import PUBLISH_TIMEOUT
 from app.messaging.topology import Topology, declare_topology
 
 logger = logging.getLogger(__name__)
@@ -18,7 +19,7 @@ class EventPublisher(Protocol):
 
 
 class RabbitEventPublisher:
-    def __init__(self, broker: RabbitBroker, topology: Topology, timeout: float) -> None:
+    def __init__(self, broker: RabbitBroker, topology: Topology, timeout: float = PUBLISH_TIMEOUT) -> None:
         self._broker = broker
         self._topology = topology
         self._timeout = timeout
@@ -26,7 +27,7 @@ class RabbitEventPublisher:
 
     async def ensure_ready(self) -> None:
         if self._ready:
-            return  # после первого подключения переподключения выполняет robust-соединение aio-pika
+            return  # дальше переподключается robust-соединение aio-pika
         await self._broker.start()
         await declare_topology(self._broker, self._topology)
         self._ready = True

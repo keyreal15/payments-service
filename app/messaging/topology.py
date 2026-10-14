@@ -1,24 +1,8 @@
-"""Топология RabbitMQ.
+"""Топология RabbitMQ (схема — в README).
 
-    API --outbox relay--> [payments] --payments.new--> (payments.new) --> consumer
-                                                          |  reject / x-delivery-limit
-                                                          v
-                                   [payments.dlx] --payments.new.dlq--> (payments.new.dlq)
-                                         ^
-    consumer --попытки исчерпаны / неисправимая ошибка (публикация с x-last-error)--+
-
-    consumer --ошибка, попытки остались--> [payments.retry] --> (payments.new.retry.<N>ms)
-                                                                  | x-message-ttl истёк
-                                                                  v
-                                                     [payments] --payments.new--> (payments.new)
-
-Все очереди — quorum: реплицируемые, с dead-lettering at-least-once (у classic-очередей
-перекладывание в DLX — at-most-once и может потерять сообщение при падении брокера)
-и x-delivery-limit, который выводит в DLQ сообщение, роняющее consumer.
-
-Экспоненциальная задержка — отдельная очередь на каждую ступень (TTL на уровне очереди):
-одна очередь с per-message TTL страдает head-of-line blocking. Значение TTL входит в имя
-очереди, поэтому смена настроек не приводит к PRECONDITION_FAILED при повторном объявлении.
+payments -> payments.new -> consumer; повторы через payments.retry -> payments.new.retry.<N>ms (TTL на уровне
+очереди, отдельная очередь на ступень — без head-of-line blocking) -> обратно в payments; финальные неудачи ->
+payments.dlx -> payments.new.dlq. Все очереди quorum: dead-lettering at-least-once и x-delivery-limit.
 """
 
 from dataclasses import dataclass
@@ -29,8 +13,7 @@ from faststream.rabbit.schemas.queue import QuorumQueueArgs
 from app.config import Settings
 from app.messaging.retry import RetryPolicy
 
-# Сколько раз брокер передоставит сообщение, не получив ack (падение consumer посреди обработки),
-# прежде чем отправить его в DLQ. Штатные retry идут через публикацию копии и счётчик не тратят.
+# Передоставки без ack (consumer падает посреди обработки) до отправки в DLQ. Штатные retry счётчик не тратят.
 DELIVERY_LIMIT = 10
 
 _AT_LEAST_ONCE_DEAD_LETTERING: QuorumQueueArgs = {
@@ -98,21 +81,13 @@ def build_topology(settings: Settings, retry_policy: RetryPolicy) -> Topology:
         retry_exchange=RabbitExchange(f"{exchange_name}.retry", type=ExchangeType.DIRECT, durable=True),
         retry_queues=retry_queues,
         dead_letter_exchange=RabbitExchange(dlx_name, type=ExchangeType.DIRECT, durable=True),
-        # У quorum-очередей RabbitMQ 4.x лимит доставок по умолчанию — 20, после чего сообщение
-        # удаляется (у DLQ нет своего DLX). Для «последнего пристанища» лимит отключаем.
+        # В RabbitMQ 4.x лимит по умолчанию — 20, после чего сообщение удаляется; для DLQ отключаем.
         dead_letter_queue=_quorum_queue(dlq_name, {"x-delivery-limit": -1}),
     )
 
 
 async def declare_topology(broker: RabbitBroker, topology: Topology, *, include_main_queue: bool = True) -> None:
-    """Идемпотентно объявляет топологию.
-
-    API объявляет всё (включая payments.new) до первой публикации — сообщения
-    маршрутизируемы, даже если consumer ещё не запущен.
-
-    Consumer передаёт include_main_queue=False и объявляет payments.new сам — на канале
-    подписчика с prefetch_count (см. create_consumer_app).
-    """
+    """Идемпотентно объявляет топологию. Consumer объявляет payments.new сам — на канале подписчика."""
     exchange = await broker.declare_exchange(topology.exchange)
     retry_exchange = await broker.declare_exchange(topology.retry_exchange)
     dlx = await broker.declare_exchange(topology.dead_letter_exchange)

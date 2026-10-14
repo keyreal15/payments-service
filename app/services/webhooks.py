@@ -91,8 +91,7 @@ class WebhookSender:
 
         url = httpx.URL(payment.webhook_url)
         try:
-            # Общий дедлайн на весь запрос (включая проверку адреса): таймаут httpx действует на каждую
-            # операцию отдельно, и медленный получатель мог бы держать слот consumer'а бесконечно.
+            # Общий дедлайн: таймаут httpx — на каждую операцию, медленный получатель держал бы слот бесконечно.
             async with asyncio.timeout(self._timeout):
                 if not self._allow_private_networks:
                     await self._ensure_public_destination(url)
@@ -109,14 +108,8 @@ class WebhookSender:
             raise WebhookDeliveryError(f"Unexpected response status {status_code}")
 
     async def _ensure_public_destination(self, url: httpx.URL) -> None:
-        """Защита от SSRF: все адреса хоста должны быть публичными.
-
-        Проверка после резолва ловит и `http://127.1`, и DNS-имена, указывающие внутрь сети.
-        От DNS rebinding между проверкой и подключением полностью защищает только egress-прокси —
-        это вне рамок сервиса (см. README).
-        """
-        # raw_host — ASCII/punycode, именно к нему подключится httpx. url.host декодирован в Unicode,
-        # а getaddrinfo перекодировал бы его по IDNA2003 (faß.de -> fass.de) — проверили бы не тот хост.
+        """Защита от SSRF: все адреса хоста после резолва должны быть публичными."""
+        # raw_host — punycode, к нему подключится httpx; url.host в Unicode getaddrinfo перекодировал бы иначе.
         host = url.raw_host.decode("ascii").strip("[]")
         port = url.port or (443 if url.scheme == "https" else 80)
         try:

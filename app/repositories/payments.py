@@ -53,9 +53,9 @@ class PaymentRepository:
         return await self._session.get(Payment, payment_id)
 
     async def acquire_lease(self, payment_id: uuid.UUID, lease_id: uuid.UUID, duration: timedelta) -> Payment | None:
-        """Берёт pending-платёж в обработку, если его не держит другой обработчик (или его аренда истекла).
+        """Берёт pending-платёж в обработку: аренда свободна, истекла или уже наша (повтор того же сообщения).
 
-        None — платёж не pending или аренда занята.
+        None — платёж не pending или аренда занята другим обработчиком.
         """
         now = func.statement_timestamp()
         stmt = (
@@ -63,7 +63,11 @@ class PaymentRepository:
             .where(
                 Payment.id == payment_id,
                 Payment.status == PaymentStatus.PENDING,
-                or_(Payment.lease_expires_at.is_(None), Payment.lease_expires_at < now),
+                or_(
+                    Payment.lease_expires_at.is_(None),
+                    Payment.lease_expires_at < now,
+                    Payment.lease_id == lease_id,
+                ),
             )
             .values(lease_id=lease_id, lease_expires_at=now + duration)
             .returning(Payment)

@@ -118,10 +118,11 @@ async def test_broker_outage_does_not_postpone_events(session_factory: SessionFa
     async with session_factory() as session:
         rows = (await session.execute(NEXT_ATTEMPT_QUERY)).all()
     for _, attempts, last_error, published_at, delay in rows:
-        assert attempts == 1
-        assert "down" in last_error
+        # Сбой брокера — не вина события: счётчик, ошибка и время следующей попытки не меняются.
+        assert attempts == 0
+        assert last_error is None
         assert published_at is None
-        assert float(delay) <= 0  # паузу держит цикл relay, сами события не откладываются
+        assert float(delay) <= 0
     # Брокер вернулся — весь backlog уходит сразу, без ожидания per-message backoff.
     assert (await make_relay(session_factory, RecordingPublisher()).publish_batch()).published == 2
 

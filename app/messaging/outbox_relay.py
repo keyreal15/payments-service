@@ -102,12 +102,11 @@ class OutboxRelay:
                 if not isinstance(result, Exception):
                     raise result  # CancelledError и прочие BaseException не глотаем
                 errors.append(result)
-                message.attempts += 1
-                message.last_error = repr(result)[:MAX_ERROR_LENGTH]
                 if isinstance(result, DeliveryError):
-                    # Брокер отказал именно этому сообщению — откладываем только его.
-                    # При недоступности брокера сообщения не откладываются: паузу держит цикл relay,
-                    # и после восстановления брокера backlog уходит сразу.
+                    # Брокер отказал именно этому сообщению — откладываем только его. Недоступность
+                    # брокера сообщения не касается: паузу держит цикл relay, счётчики не растут.
+                    message.attempts += 1
+                    message.last_error = repr(result)[:MAX_ERROR_LENGTH]
                     message.next_attempt_at = func.statement_timestamp() + timedelta(
                         seconds=self._backoff(message.attempts)
                     )
